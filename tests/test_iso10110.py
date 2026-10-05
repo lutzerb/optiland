@@ -116,7 +116,9 @@ class TestIdentifyElementsWarnings:
             warnings.simplefilter("always")
             elements = identify_elements(lens)
         assert len(elements) == 1
-        assert caught == []
+        # Only our own UserWarnings matter; unrelated deprecation/backend
+        # warnings can leak in depending on suite order.
+        assert [w for w in caught if w.category is UserWarning] == []
 
     def test_cemented_doublet_emits_no_warnings(self):
         from optiland.iso10110.elements import identify_elements
@@ -126,7 +128,9 @@ class TestIdentifyElementsWarnings:
             warnings.simplefilter("always")
             elements = identify_elements(lens)
         assert len(elements) == 1
-        assert caught == []
+        # Only our own UserWarnings matter; unrelated deprecation/backend
+        # warnings can leak in depending on suite order.
+        assert [w for w in caught if w.category is UserWarning] == []
 
 
 # ---------------------------------------------------------------------------
