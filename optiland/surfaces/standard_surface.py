@@ -12,6 +12,7 @@ Kramer Harrison, 2023
 
 from __future__ import annotations
 
+import inspect
 import warnings
 from typing import TYPE_CHECKING
 
@@ -30,6 +31,46 @@ if TYPE_CHECKING:
     from optiland.rays import BaseRays, ParaxialRays, RealRays
 
 
+def _aperture_aware_distance(surface, rays: RealRays):
+    """Intersection distance from a surface's geometry, aperture-aware when
+    the geometry supports it.
+
+    Geometries whose ``distance`` accepts an ``aperture`` keyword receive the
+    surface's physical aperture so they can prefer intersections on the used
+    region of the surface (see
+    :func:`optiland.geometries.standard._conic_intersection_distance`).
+    Custom geometries with the plain ``distance(rays)`` signature keep
+    working unchanged. The capability check is cached on ``surface``, keyed
+    to the geometry object so a swapped geometry is re-inspected.
+
+    A module-level function rather than a ``Surface`` method so that every
+    surface-like object works without forwarding: ``SurfaceView`` dispatches
+    the tracing kernels through ``type(base_surface)`` bound to itself, and
+    this helper only needs ``surface.geometry`` / ``surface.aperture``, which
+    views resolve through their passthrough properties.
+
+    Args:
+        surface: A surface-like object exposing ``geometry`` and ``aperture``.
+        rays (RealRays): The rays, localized to the surface.
+
+    Returns:
+        be.ndarray: Propagation distance per ray.
+
+    """
+    geometry = surface.geometry
+    cached = getattr(surface, "_distance_capability", None)
+    if cached is None or cached[0] is not geometry:
+        parameters = inspect.signature(geometry.distance).parameters
+        accepts_aperture = "aperture" in parameters or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+        )
+        cached = (geometry, accepts_aperture)
+        surface._distance_capability = cached
+    if cached[1]:
+        return geometry.distance(rays, aperture=surface.aperture)
+    return geometry.distance(rays)
+
+
 class _TracingCoordinator:
     """Owns the localize → intersect → globalize → clip → interact → record pipeline.
 
@@ -38,12 +79,15 @@ class _TracingCoordinator:
     the surface are always reflected without recreating the coordinator.
     """
 
-    def trace(self, rays: BaseRays, surface: Surface) -> BaseRays:
+    def trace(self, rays: BaseRays, surface: Surface, record: bool = True) -> BaseRays:
         """Execute the full ray-surface interaction pipeline.
 
         Args:
             rays: The rays to be traced.
             surface: The surface being traced through.
+            record: Whether to store a snapshot of the ray state on the
+                surface after tracing. Recording keeps eight full-size arrays
+                alive per surface; pass False when only the final rays matter.
 
         Returns:
             The traced rays.
@@ -52,7 +96,8 @@ class _TracingCoordinator:
         surface.geometry.localize(rays)
         rays = rays.trace_on_surface(surface)
         surface.geometry.globalize(rays)
-        rays.record_on_surface(surface)
+        if record:
+            rays.record_on_surface(surface)
         return rays
 
 
@@ -109,6 +154,7 @@ class Surface(ObserverMixin):
             self.interaction_model.parent_surface = self
 
         self.thickness = 0.0  # used for surface positioning
+        self.mirror_thickness: float | None = None  # mechanical drawing only
         ObserverMixin.__init__(self)
         self.reset()
 
@@ -204,17 +250,19 @@ class Surface(ObserverMixin):
         super().__init_subclass__(**kwargs)
         Surface._registry[cls.__name__] = cls
 
-    def trace(self, rays: BaseRays) -> BaseRays:
+    def trace(self, rays: BaseRays, record: bool = True) -> BaseRays:
         """Traces the given rays through the surface.
 
         Args:
             rays (BaseRays): The rays to be traced.
+            record (bool, optional): Whether to store the traced ray state on
+                the surface. Defaults to True.
 
         Returns:
             BaseRays: The traced rays.
 
         """
-        return self._coordinator.trace(rays, self)
+        return self._coordinator.trace(rays, self, record=record)
 
     @property
     def _coordinator(self) -> _TracingCoordinator:
@@ -250,9 +298,11 @@ class Surface(ObserverMixin):
             RealRays: The traced real rays.
 
         """
-        t = self.geometry.distance(rays)
+        t = _aperture_aware_distance(self, rays)
         self.material_pre.propagation_model.propagate(rays, t)
-        rays.opd = rays.opd + be.abs(t * self.material_pre.n(rays.w))
+        # t is oriented along the ray: virtual propagation subtracts OPL.
+        # Real return paths after reflection still have t > 0 and add OPL.
+        rays.opd = rays.opd + t * self.material_pre.n(rays.w)
         if self.aperture:
             self.aperture.clip(rays)
         rays = self.interaction_model.interact_real_rays(rays)

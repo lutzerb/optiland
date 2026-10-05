@@ -14,14 +14,17 @@ class LinearGratingPhaseProfile(BasePhaseProfile):
     This profile defines a constant phase gradient across the surface,
     representing a simple transmission or reflection grating.
 
-    The phase is defined as:
-    φ(x, y) = K_x * x + K_y * y
-    where (K_x, K_y) is the grating wavevector.
+    The phase is defined as::
 
-    The grating vector is defined by its magnitude |K| = 2π / period and its
-    angle (theta) relative to the positive x-axis.
-    K_x = (2π / period) * cos(angle)
-    K_y = (2π / period) * sin(angle)
+        φ(x, y) = K_x * x + K_y * y
+
+    where ``(K_x, K_y)`` is the grating wavevector.
+
+    The grating vector is defined by its magnitude ``|K| = 2π / period`` and
+    its angle (theta) relative to the positive x-axis::
+
+        K_x = (2π / period) * cos(angle)
+        K_y = (2π / period) * sin(angle)
 
     Args:
         period (float): The spatial period of the grating in mm. Must be positive.
@@ -94,7 +97,9 @@ class LinearGratingPhaseProfile(BasePhaseProfile):
         phi_z = be.zeros_like(x)
         return phi_x, phi_y, phi_z
 
-    def get_paraxial_gradient(self, y: be.Array) -> be.Array:
+    def get_paraxial_gradient(
+        self, y: be.Array, wavelength: be.Array = None
+    ) -> be.Array:
         """Calculates the paraxial phase gradient at y-coordinate.
 
         This is the gradient d_phi/dy evaluated at x=0. For a linear
@@ -102,6 +107,7 @@ class LinearGratingPhaseProfile(BasePhaseProfile):
 
         Args:
             y: The y-coordinates of the points of interest. Used for shape.
+            wavelength: Unused; the grating phase gradient is wavelength-independent.
 
         Returns:
             The paraxial phase gradient (K_y) at each y-coordinate.

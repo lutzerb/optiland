@@ -21,3 +21,9 @@ sg_execution_times.rst
 scratch/
 docs/examples/iso10110_output/
 **/*.doit.db
+# The rule above targets Windows virtualenv Scripts/ directories; on
+# case-insensitive filesystems it also hides the repository scripts/ tree.
+!/scripts/
+/.compat-venv/
+/compatibility-reports/
+/downloaded-reports/

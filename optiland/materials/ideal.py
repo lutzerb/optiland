@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING
 
 import optiland.backend as be
 from optiland.materials.base import BaseMaterial
-from optiland.propagation.base import BasePropagationModel
 
 if TYPE_CHECKING:
     from optiland.propagation.base import BasePropagationModel
@@ -22,6 +21,9 @@ if TYPE_CHECKING:
 class IdealMaterial(BaseMaterial):
     """Represents an ideal material with a fixed refractive index and extinction
     coefficient for all wavelengths.
+
+    Evaluation preserves each stored parameter's dtype when the backend's default
+    precision changes, while converting to the active backend and device.
 
     Attributes:
         index (float): The refractive index of the material.
@@ -39,6 +41,17 @@ class IdealMaterial(BaseMaterial):
         self.index = be.array([n])
         self.absorp = be.array([k])
 
+    @property
+    def display_name(self) -> str:
+        """Show a constant index; identify air only when extinction is zero."""
+        if self.index.item() == 1 and self.absorp.item() == 0:
+            return "Air"
+        return str(self.index.item())
+
+    def _cache_state(self) -> tuple | None:
+        """Track live index/extinction values, including in-place writes."""
+        return self._state_key((self.index, self.absorp))
+
     def _calculate_n(self, wavelength, **kwargs):
         """Returns the refractive index of the material.
 
@@ -52,11 +65,12 @@ class IdealMaterial(BaseMaterial):
             scalar if wavelength is scalar, otherwise an array of the same shape
             as wavelength, filled with the constant refractive index.
         """
+        index = self._as_backend_array(self.index, preserve_dtype=True)[0]
         if be.is_array_like(wavelength) and be.size(wavelength) > 1:
-            # ``be.full_like(w, value)`` reads the value out as a scalar and
-            # detaches it; broadcasting keeps a trainable index attached.
-            return be.ones_like(wavelength) * self.index[0]
-        return self.index[0]
+            # Broadcast the parameter itself: multiplying by default-precision
+            # ones can downcast a scalar parameter and lose its precision.
+            return self._broadcast_like(index, wavelength)
+        return index
 
     def _calculate_k(self, wavelength, **kwargs):
         """Returns the extinction coefficient of the material.
@@ -71,11 +85,11 @@ class IdealMaterial(BaseMaterial):
             scalar if wavelength is scalar, otherwise an array of the same shape
             as wavelength, filled with the constant extinction coefficient.
         """
+        absorp = self._as_backend_array(self.absorp, preserve_dtype=True)[0]
         if be.is_array_like(wavelength) and be.size(wavelength) > 1:
-            # Broadcast (rather than full_like) to keep a trainable extinction
-            # coefficient attached to the autograd graph.
-            return be.ones_like(wavelength) * self.absorp[0]
-        return self.absorp[0]
+            # A broadcast view preserves both parameter precision and gradients.
+            return self._broadcast_like(absorp, wavelength)
+        return absorp
 
     def to_dict(self):
         """Returns a dictionary representation of the material.

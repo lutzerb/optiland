@@ -13,7 +13,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import optiland.backend as be
+from optiland.materials.base import BaseMaterial
 from optiland.materials.ideal import IdealMaterial
+from optiland.propagation.homogeneous import HomogeneousPropagation
 
 if TYPE_CHECKING:
     from optiland.optic import Optic
@@ -34,15 +36,47 @@ FIELD_CLASS_TO_TYPE: dict[str, str] = {
 
 
 def is_air(material: Any) -> bool:
-    """Return True if *material* represents air (n ~= 1.0, non-absorbing)."""
+    """Return True for exact unit index without extinction."""
     if material is None:
         return True
     if isinstance(material, str) and material.lower() in ("air", ""):
         return True
     if isinstance(material, IdealMaterial):
         n_val = float(be.atleast_1d(material.index)[0])
-        return abs(n_val - 1.0) < 1e-6
+        k_val = float(be.atleast_1d(material.absorp)[0])
+        return n_val == 1.0 and k_val == 0.0
     return False
+
+
+def reject_unsupported_ideal_absorption(material: Any) -> None:
+    """Fail before encoding an ideal material into a format that would lose k."""
+    if isinstance(material, IdealMaterial) and be.any(material.absorp != 0):
+        raise NotImplementedError(
+            "This writer cannot preserve ideal-material absorption; use native JSON"
+        )
+
+
+def reject_unsupported_propagation(material: Any) -> None:
+    """Reject propagation these homogeneous-only writers cannot represent.
+
+    A subclass can change the physics, so inheriting HomogeneousPropagation
+    is insufficient. Legacy string specifications have no propagation object.
+    This does not establish support for an unknown material's optical law.
+    """
+    if (
+        isinstance(material, BaseMaterial)
+        and type(material.propagation_model) is not HomogeneousPropagation
+    ):
+        raise NotImplementedError(
+            "This writer cannot preserve custom propagation; use native JSON"
+        )
+
+
+def validate_material_propagation(optic: Optic) -> None:
+    """Check both sides before any air, catalog, model-glass or mirror shortcut."""
+    for surface in optic.surfaces:
+        reject_unsupported_propagation(surface.material_pre)
+        reject_unsupported_propagation(surface.material_post)
 
 
 def field_type_string(optic: Optic) -> str:

@@ -13,12 +13,20 @@ import warnings
 from typing import TYPE_CHECKING, Any
 
 import optiland.backend as be
-from optiland.fileio.common import WL_D, compute_abbe_number, field_type_string, is_air
+from optiland.fileio.common import (
+    WL_D,
+    compute_abbe_number,
+    field_type_string,
+    is_air,
+    reject_unsupported_ideal_absorption,
+    validate_material_propagation,
+)
 from optiland.fileio.zemax.model import ZemaxDataModel
 from optiland.fileio.zemax.surfaces import (
     CoordinateBreakSurfaceHandler,
     get_handler_for_optiland_type,
 )
+from optiland.materials.data import DataMaterial
 from optiland.materials.material import Material
 
 if TYPE_CHECKING:
@@ -72,6 +80,7 @@ class OpticToZemaxConverter:
         Returns:
             A populated ZemaxDataModel ready for ZemaxFileEncoder.
         """
+        validate_material_propagation(self._optic)
         model = ZemaxDataModel()
         model.name = self._optic.name
         self._convert_aperture(model)
@@ -322,6 +331,12 @@ class OpticToZemaxConverter:
         # medium, so is_air() is True for a mirror in air.
         if is_reflective:
             return {"name": "MIRROR"}
+
+        reject_unsupported_ideal_absorption(mat)
+        if isinstance(mat, DataMaterial):
+            raise NotImplementedError(
+                "This writer cannot preserve DataMaterial optical data; use native JSON"
+            )
 
         if is_air(mat):
             return None

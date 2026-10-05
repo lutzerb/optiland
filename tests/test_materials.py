@@ -20,6 +20,9 @@ from .utils import assert_allclose
 class TestBaseMaterial:
     def test_caching(self, set_test_backend):
         class DummyMaterial(BaseMaterial):
+            def _cache_state(self):
+                return ()
+
             def _calculate_n(self, wavelength, **kwargs):
                 pass
 
@@ -67,11 +70,11 @@ class TestBaseMaterial:
         assert BaseMaterial._detach_if_tensor(1.5) == 1.5
         assert BaseMaterial._detach_if_tensor(None) is None
 
-    def test_large_array_cache_key_runtime_is_sublinear(self, set_test_backend):
-        """Regression guard for O(N) array cache-key construction.
+    def test_large_array_cache_key_avoids_python_scalar_overhead(self, set_test_backend):
+        """Bound Python overhead for large-array content checks.
 
-        Large wavelength arrays should use metadata-based keys rather than
-        materializing every array element into a Python tuple.
+        Mutable arrays require O(N) inspection on every lookup. A digest should
+        still cost much less than constructing a tuple of 200,000 Python scalars.
         """
 
         class DummyMaterial(BaseMaterial):
@@ -104,7 +107,7 @@ class TestBaseMaterial:
 
         ratio = large_avg_s / max(small_avg_s, 1e-9)
         assert ratio < 40.0, (
-            "Large-array cache-key generation appears to scale linearly with array size "
+            "Large-array content checks incur excessive per-element overhead "
             f"(ratio={ratio:.2f}, small_avg={small_avg_s:.3e}s, large_avg={large_avg_s:.3e}s)"
         )
 
@@ -167,14 +170,15 @@ class TestBaseMaterial:
 
         assert material._create_cache_key(a) != material._create_cache_key(b)
 
-    def test_large_array_digest_cache_evicts_dead_arrays(self, set_test_backend):
-        """#630: the per-array digest memo is weak -- entries are dropped when
-        the array is collected, so id() reuse cannot surface a stale digest and
-        the memo cannot grow without bound.
-        """
-        from optiland.materials.base import _ARRAY_DIGEST_CACHE
+    def test_large_array_cache_does_not_reuse_dead_array_content(self, set_test_backend):
+        """#630: recycled array addresses must never return an old optical value.
 
+        Content is re-inspected; no per-array identity memo is retained.
+        """
         class DummyMaterial(BaseMaterial):
+            def _cache_state(self):
+                return ()
+
             def _calculate_n(self, wavelength, **kwargs):
                 return float(np.asarray(wavelength)[1])
 
@@ -185,16 +189,17 @@ class TestBaseMaterial:
         n = 2_000
 
         gc.collect()
-        baseline = len(_ARRAY_DIGEST_CACHE)
         for i in range(50):
             arr = np.zeros(n, dtype=np.float64)
-            arr[1] = float(i)  # content (and so the expected n) differs each round
-            assert material.n(arr) == float(i)  # never a stale cross-array value
+            # content (and so the expected n) differs each round; the +1 keeps
+            # the array non-uniform so every round takes the digest path
+            arr[1] = float(i) + 1.0
+            assert material.n(arr) == float(i) + 1.0  # never a stale value
             del arr
             gc.collect()  # free the buffer so the next array may reuse its address
 
         gc.collect()
-        assert len(_ARRAY_DIGEST_CACHE) <= baseline + 2
+        assert len(material._n_cache) == 50
 
     def test_large_array_key_handles_non_weakref_sequence(self, set_test_backend):
         """list/tuple wavelengths are content-addressed too, but cannot be
@@ -238,6 +243,75 @@ class TestBaseMaterial:
     "torch" not in be.list_available_backends(),
     reason="PyTorch not installed",
 )
+class TestUniformWavelengthFastPath:
+    """A large wavelength bundle holding one repeated value — the shape every
+    single-wavelength trace produces — is keyed by that value, evaluated on a
+    single element, and served back as a broadcast view. The cache then holds
+    one number per wavelength instead of one full-size array per bundle, and
+    no device-to-host content hash is needed."""
+
+    @staticmethod
+    def _dispersive_dummy():
+        class DummyMaterial(BaseMaterial):
+            def _cache_state(self):
+                return ()
+
+            def _calculate_n(self, wavelength, **kwargs):
+                return 1.0 + 0.1 * wavelength**2
+
+            def _calculate_k(self, wavelength, **kwargs):
+                return 0.01 * wavelength
+
+        return DummyMaterial()
+
+    def test_matches_full_evaluation(self, set_test_backend):
+        material = self._dispersive_dummy()
+        n_rays = 5_000  # above _MAX_VALUE_KEY_ARRAY_SIZE -> large-array path
+        uniform = be.full((n_rays,), 0.55)
+        result = be.to_numpy(material.n(uniform))
+        assert result.shape == (n_rays,)
+        assert_allclose(result, np.full(n_rays, 1.0 + 0.1 * 0.55**2))
+
+    def test_cache_holds_single_value_not_full_bundle(self, set_test_backend):
+        material = self._dispersive_dummy()
+        # Built from numpy so the bundle never requires grad — differentiable
+        # results bypass the cache by design, and here the cache is the point.
+        uniform = be.asarray(np.full(50_000, 0.55))
+        material.n(uniform)
+        material.k(uniform)
+        (cached_n,) = material._n_cache.values()
+        (cached_k,) = material._k_cache.values()
+        assert be.size(cached_n) == 1
+        assert be.size(cached_k) == 1
+
+    def test_equal_value_bundles_share_key(self, set_test_backend):
+        material = self._dispersive_dummy()
+        a = be.full((5_000,), 0.55)
+        b = be.full((5_000,), 0.55)  # same content, different object/buffer
+        nonuniform = be.asarray(np.linspace(0.4, 0.7, 5_000))
+        assert material._create_cache_key(a) == material._create_cache_key(b)
+        assert material._create_cache_key(a) != material._create_cache_key(nonuniform)
+
+    def test_nonuniform_bundle_still_evaluated_elementwise(self, set_test_backend):
+        material = self._dispersive_dummy()
+        values = np.linspace(0.4, 0.7, 5_000)
+        result = be.to_numpy(material.n(be.asarray(values)))
+        assert_allclose(result, 1.0 + 0.1 * values**2)
+
+    def test_inference_mode_does_not_crash(self, set_test_backend):
+        """Torch inference tensors have no version counter; the cache-key
+        builder must inspect their content without raising."""
+        if be.get_backend() != "torch":
+            pytest.skip("torch-only regression")
+        import torch
+
+        material = self._dispersive_dummy()
+        with torch.inference_mode():
+            uniform = be.full((5_000,), 0.55)
+            result = material.n(uniform)
+        assert be.to_numpy(result).shape == (5_000,)
+
+
 class TestBaseMaterialTorchCaching:
     """Tests for material caching behavior specific to torch backend.
 
@@ -249,6 +323,7 @@ class TestBaseMaterialTorchCaching:
 
     @pytest.fixture(autouse=True)
     def _setup_torch(self):
+        pytest.importorskip("torch")
         be.set_backend("torch")
         be.set_device("cpu")
         be.grad_mode.enable()
@@ -733,6 +808,7 @@ class TestMaterialFile:
         material = materials.MaterialFile(filename)
         assert material.to_dict() == {
             "filename": filename,
+            "bounds": "clamp",
             "type": materials.MaterialFile.__name__,
             "propagation_model": {"class": "HomogeneousPropagation"},
         }
@@ -809,6 +885,7 @@ class TestMaterial:
         mat_dict = material.to_dict()
         assert mat_dict == {
             "type": "Material",
+            "bounds": "clamp",
             "filename": material.filename,
             "name": "SF11",
             "reference": None,

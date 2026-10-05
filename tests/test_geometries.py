@@ -1346,6 +1346,9 @@ class TestZernikeGeometry:
 
         assert_allclose(actual, expected, atol=1e-8)
 
+    @pytest.mark.skipif(
+        "torch" not in be.list_available_backends(), reason="Requires the Torch backend"
+    )
     @pytest.mark.parametrize("set_test_backend", ["torch"], indirect=True)
     def test_surface_normal_at_center_autograd(self, set_test_backend):
         geometry = self.create_geometry(
@@ -1968,21 +1971,23 @@ class TestToroidalGeometry:
         with pytest.raises(ValueError):
             geometries.ToroidalGeometry.from_dict(invalid_dict)
 
-    def test_inf_radius_intersect_sphere_normal_incidence(
+    def test_inf_radius_distance_normal_incidence(
         self, cylinder_x_geometry, set_test_backend
     ):
-        """Test _intersection_sphere for inf radius: ray normal to XY plane (z=0 plane)."""
+        """Distance for inf rotation radius: ray normal to XY plane (z=0 plane).
+
+        Exercises the planar branch of the Newton-Raphson seed
+        (StandardGeometry.distance with radius = inf) through the public API.
+        """
 
         rays = RealRays(
             x=0.0, y=0.0, z=10.0, L=0.0, M=0.0, N=-1.0, intensity=1.0, wavelength=0.55
         )
-        ix, iy, iz = cylinder_x_geometry._intersection(rays)
+        t = cylinder_x_geometry.distance(rays)
 
-        be.allclose(ix, be.array(0.0), rtol=1e-5, atol=1e-6)
-        be.allclose(iy, be.array(0.0), rtol=1e-5, atol=1e-6)
-        be.allclose(
-            iz, be.array(0.0), rtol=1e-5, atol=1e-6
-        )  # Intersection coordinates should be (0, 0, 0)
+        # The cylinder vertex line passes through the origin, so the ray
+        # lands at (0, 0, 0) after propagating t = 10.
+        assert_allclose(t, 10.0, atol=1e-9)
 
 
 class TestBiconicGeometry:
@@ -2115,8 +2120,9 @@ class TestBiconicGeometry:
             x=1.0, y=1.0, z=-5.0, L=0.0, M=0.0, N=1.0, wavelength=0.55, intensity=1.0
         )
         # Distance to plane z=0 should be 5.0
-        # The parent NewtonRaphsonGeometry's _intersection calls _intersection_plane if self.radius is inf.
-        # In Biconic.__init__, self.radius is set to radius_x. So this path is tested.
+        # The Newton-Raphson seed (StandardGeometry.distance) takes its planar
+        # branch when self.radius is inf. In Biconic.__init__, self.radius is
+        # set to radius_x. So this path is tested.
         assert_allclose(geom.distance(rays), 5.0, atol=1e-9)
 
     def test_to_dict_from_dict(self, set_test_backend):
@@ -2450,12 +2456,12 @@ class TestForbesQbfsGeometry:
         optic.surfaces.add(index=4)
         return optic
 
-    @pytest.mark.parametrize("backend_name", ["torch"])
-    def test_ray_tracing_autodiff_off_axis(self, backend_name):
+    @pytest.mark.skipif(
+        "torch" not in be.list_available_backends(), reason="Requires the Torch backend"
+    )
+    @pytest.mark.parametrize("set_test_backend", ["torch"], indirect=True)
+    def test_ray_tracing_autodiff_off_axis(self, set_test_backend):
         """Tests that ray tracing is differentiable for a general off-axis ray."""
-        be.set_backend(backend_name)
-        if be.get_backend() != "torch":
-            pytest.skip("Autodiff test requires the torch backend.")
 
         optic = self._create_forbes_autodiff_optic()
         forbes_surface = optic.surfaces[3].geometry
@@ -2478,15 +2484,15 @@ class TestForbesQbfsGeometry:
         assert any(g is not None and be.to_numpy(g) != 0 for g in grads)
 
     # --- NEW TEST ADDED ---
-    @pytest.mark.parametrize("backend_name", ["torch"])
-    def test_ray_tracing_autodiff_at_vertex(self, backend_name):
+    @pytest.mark.skipif(
+        "torch" not in be.list_available_backends(), reason="Requires the Torch backend"
+    )
+    @pytest.mark.parametrize("set_test_backend", ["torch"], indirect=True)
+    def test_ray_tracing_autodiff_at_vertex(self, set_test_backend):
         """
         Tests that ray tracing is differentiable for a ray hitting the exact
         vertex, which was the source of the NaN gradient bug.
         """
-        be.set_backend(backend_name)
-        if be.get_backend() != "torch":
-            pytest.skip("Autodiff test requires the torch backend.")
 
         be.grad_mode.enable()
 
@@ -2511,13 +2517,15 @@ class TestForbesQbfsGeometry:
         assert grad is not None, "Gradient at vertex should not be None"
         assert not be.isnan(grad), "Gradient at vertex must not be NaN"
 
-    @pytest.mark.parametrize("backend_name", ["torch"])
-    def test_forbes_qbfs_autodiff_inplace_modification(self, backend_name):
+    @pytest.mark.skipif(
+        "torch" not in be.list_available_backends(), reason="Requires the Torch backend"
+    )
+    @pytest.mark.parametrize("set_test_backend", ["torch"], indirect=True)
+    def test_forbes_qbfs_autodiff_inplace_modification(self, set_test_backend):
         """
         Tests for in-place modification errors during backpropagation with ForbesQbfsGeometry.
         This test replicates the conditions that led to the RuntimeError in the user's notebook.
         """
-        be.set_backend(backend_name)
         be.grad_mode.enable()
         from optiland.analysis import IncoherentIrradiance
         from optiland.physical_apertures import RectangularAperture
@@ -2818,9 +2826,11 @@ class TestForbesQ2dGeometry:
         optic.surfaces.add(index=2)
         return optic, trainable_coeff
 
-    @pytest.mark.parametrize("backend_name", ["torch"])
-    def test_gradient_stability_at_vertex(self, backend_name):
-        be.set_backend(backend_name)
+    @pytest.mark.skipif(
+        "torch" not in be.list_available_backends(), reason="Requires the Torch backend"
+    )
+    @pytest.mark.parametrize("set_test_backend", ["torch"], indirect=True)
+    def test_gradient_stability_at_vertex(self, set_test_backend):
         be.grad_mode.enable()
 
         optic, trainable_coeff = self._create_forbes_q2d_autodiff_optic()
@@ -2915,26 +2925,6 @@ class TestForbesValidation:
                 calculated_q_val = poly_sum_m_gt0 / (u**m)
             else:
                 pytest.skip("Skipping test at u=0 for m>0.")
-
-    def test_qnm_values_against_analytical_formula(self, set_test_backend):
-        n, m = 1, 2
-        x = 0.4
-        P_n_m_canonical = 1.5 - x
-        from optiland.geometries.forbes.qpoly import f_q2d, g_q2d
-
-        P_0_m = 0.5
-        f0 = f_q2d(n=0, m=m)
-        Q_0_m_canonical = P_0_m / f0
-        g0 = g_q2d(n=0, m=m)
-        f1 = f_q2d(n=1, m=m)
-        Q_n_m_canonical = (P_n_m_canonical - g0 * Q_0_m_canonical) / f1
-        coeffs_to_test = [0.0] * (n + 1)
-        coeffs_to_test[n] = 1.0
-        from optiland.geometries.forbes.qpoly import clenshaw_q2d
-
-        alphas = clenshaw_q2d(coeffs_to_test, m=m, usq=x)
-        Q_n_m_optiland = 0.5 * alphas[0]
-        assert np.allclose(Q_n_m_optiland, Q_n_m_canonical, atol=1e-9)
 
     def test_qnm_values_against_analytical_formula(self, set_test_backend):
         """

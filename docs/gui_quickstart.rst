@@ -64,6 +64,11 @@ When you first open the Optiland GUI, you'll see a main window containing severa
     *   **2D View**: Shows a 2D cross-section of the lens, with options to display rays.
     *   **3D View**: Renders a 3D model of the system (if VTK is installed and working).
 
+    In the 2D view, select **Zoom to rectangle** and drag around the area to
+    inspect. The drawing stays fixed while the rectangle is drawn; releasing
+    the mouse applies the zoom. Toolbar pan and ordinary drag-pan use separate
+    gestures. **Back** and **Forward** navigate the resulting view history.
+
     .. image:: _static/gui_viewer_panel.png
        :alt: Viewer Panel (2D/3D)
        :align: center
@@ -101,6 +106,17 @@ Optiland features a VS Code-style **Command Palette** that provides quick access
 .. note::
 
    All windows are dockable and can be rearranged to suit your workflow. You can also save your layout for future sessions. These can be loaded by pressing "1" or "2" in the top toolbar, corresponding to the slot used for saving your layout.
+
+Notifications
+-------------
+
+Notifications appear at the bottom-right of the main window. Click the
+notification card or its close button to dismiss it. You can also use ``Tab``
+to focus the close button, labeled "Dismiss notification", and press ``Space``.
+
+Error notifications stay visible until dismissed or replaced by newer
+notifications when the three-card stack is full. Information, success, and
+warning notifications disappear automatically after seven seconds.
 
 Light theme and Dark theme
 --------------------------

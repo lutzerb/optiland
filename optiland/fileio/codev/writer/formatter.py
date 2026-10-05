@@ -15,7 +15,14 @@ from typing import TYPE_CHECKING, Any
 import optiland.backend as be
 from optiland.fileio.codev.model import CodeVDataModel
 from optiland.fileio.codev.surfaces import get_handler_for_optiland_type
-from optiland.fileio.common import compute_abbe_number, field_type_string, is_air
+from optiland.fileio.common import (
+    compute_abbe_number,
+    field_type_string,
+    is_air,
+    reject_unsupported_ideal_absorption,
+    validate_material_propagation,
+)
+from optiland.materials.data import DataMaterial
 from optiland.materials.material import Material
 
 if TYPE_CHECKING:
@@ -48,6 +55,7 @@ class OpticToCodeVConverter:
         Returns:
             A populated CodeVDataModel ready for CodeVFileEncoder.
         """
+        validate_material_propagation(self._optic)
         model = CodeVDataModel()
         model.name = self._optic.name
         model.radius_mode = True  # always write radii
@@ -266,6 +274,12 @@ class OpticToCodeVConverter:
         # Mirror surface — detected via interaction_model.is_reflective
         if is_reflective:
             return {"name": "REFL"}
+
+        reject_unsupported_ideal_absorption(mat)
+        if isinstance(mat, DataMaterial):
+            raise NotImplementedError(
+                "This writer cannot preserve DataMaterial optical data; use native JSON"
+            )
 
         if is_air(mat):
             return None

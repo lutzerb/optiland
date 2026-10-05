@@ -2,8 +2,8 @@
 
 This module defines the base class for materials. The base class provides
 methods to calculate the refractive index, extinction coefficient, and Abbe
-number of a material. Subclasses of BaseMaterial should implement the `n` and
-`k` methods to provide specific material properties.
+number of a material. Subclasses implement `_calculate_n` and `_calculate_k`;
+the public methods manage evaluation and optional caching.
 
 Kramer Harrison, 2024
 """
@@ -11,7 +11,7 @@ Kramer Harrison, 2024
 from __future__ import annotations
 
 import hashlib
-import weakref
+import math
 from abc import ABC, abstractmethod
 
 import numpy as np
@@ -26,13 +26,6 @@ try:
 except (ImportError, ModuleNotFoundError):
     torch = None
 
-# Maps id(array) -> (weakref, content_digest, version_token) so the O(N) content
-# hash in BaseMaterial._array_metadata_key runs once per array object and is
-# reused on later lookups. The weakref callback evicts the entry when the array
-# is collected, so a later array reusing the same id() never reads a stale
-# digest.
-_ARRAY_DIGEST_CACHE: dict[int, tuple] = {}
-
 
 def _array_content_key(value, digest: bytes) -> tuple:
     """Assemble a cache-key tuple from a content digest plus coarse metadata."""
@@ -45,6 +38,45 @@ def _array_content_key(value, digest: bytes) -> tuple:
     )
 
 
+def _array_uniform_key(value, scalar: float) -> tuple:
+    """Assemble a cache-key tuple for an array whose elements are all equal."""
+    return (
+        "array-uniform",
+        scalar,
+        tuple(getattr(value, "shape", ())),
+        str(getattr(value, "dtype", type(value).__name__)),
+        str(getattr(value, "device", None)),
+    )
+
+
+def _uniform_scalar(value) -> float | None:
+    """Return the common value of a constant array, or None if not constant.
+
+    Ray bundles traced at a single wavelength carry that wavelength repeated
+    per ray, so the by-far most common "large array" seen here is a broadcast
+    constant. Detecting it costs one on-device reduction instead of the full
+    device-to-host copy plus O(N) hash of the content-digest path, and lets
+    the property caches store a single value instead of an N-element result.
+    """
+    try:
+        if torch is not None and isinstance(value, torch.Tensor):
+            # The key only needs the numeric value; detaching avoids the
+            # scalar-conversion warning for grad-attached bundles and keeps
+            # the uniformity probe off the autograd graph.
+            detached = value.detach()
+            first = detached.reshape(-1)[0]
+            if bool(torch.eq(detached, first).all()):
+                return float(first)
+            return None
+        array = np.asarray(value)
+        first = array.flat[0]
+        if np.all(array == first):
+            return float(first)
+        return None
+    except (IndexError, TypeError, ValueError, RuntimeError):
+        return None
+
+
 class BaseMaterial(ABC):
     """Base class for materials.
 
@@ -52,8 +84,8 @@ class BaseMaterial(ABC):
     refractive index (n) and extinction coefficient (k). It also provides a
     method to calculate the Abbe number.
 
-    Subclasses of BaseMaterial should implement the abstract methods `n` and
-    `k` to provide specific material properties.
+    Subclasses implement `_calculate_n` and `_calculate_k`. Result caching is
+    optional: override `_cache_state` only when all optical state can be tracked.
 
     Attributes:
         propagation_model: The model used to propagate rays through this
@@ -83,6 +115,7 @@ class BaseMaterial(ABC):
         """
         self._n_cache = {}
         self._k_cache = {}
+        self._cache_context = None
 
         if propagation_model is None:
             self.propagation_model = HomogeneousPropagation(self)
@@ -105,7 +138,7 @@ class BaseMaterial(ABC):
             return None
 
         try:
-            return int(np.prod(shape, dtype=np.int64))
+            return math.prod(shape)
         except Exception:
             return None
 
@@ -121,52 +154,112 @@ class BaseMaterial(ABC):
         return the previous array's refractive index -- a silent
         cross-wavelength leak (issue #630).
 
-        Hashing the bytes is O(N), so the digest is memoized per array object in
-        ``_ARRAY_DIGEST_CACHE``; repeated lookups of the same array (e.g. one
-        wavelength bundle traced through every surface) are amortized O(1). A
-        weakref callback drops the entry when the array dies, so id() reuse can
-        never surface a stale digest.
+        Inspect caller-owned storage on every lookup. NumPy has no mutation
+        counter, Torch inference tensors are mutable without a version counter,
+        and writes through a NumPy alias do not increment a Torch version.
+        Identity/version memoization therefore cannot guarantee correctness.
 
-        NumPy exposes no in-place-write counter, so an array is treated as
-        immutable for its lifetime (optiland never mutates wavelength buffers in
-        place). Torch tensors carry ``_version``, folded into the memoization
-        token so in-place edits invalidate the cached digest.
+        Constant arrays -- the overwhelmingly common case, since a ray bundle
+        traced at one wavelength repeats that wavelength per ray -- are detected
+        first and keyed by their single value, skipping the device-to-host copy
+        and O(N) hash entirely while remaining content-addressed.
         """
-        oid = id(value)
-        token = int(getattr(value, "_version", 0))
-        cached = _ARRAY_DIGEST_CACHE.get(oid)
-        if cached is not None:
-            ref, digest, cached_token = cached
-            if ref() is value and cached_token == token:
-                return _array_content_key(value, digest)
+        # Lists and tuples have no shape/dtype attributes. Normalize only the
+        # key input so nested and flat sequences cannot share a fingerprint.
+        if isinstance(value, (list, tuple)):
+            value = np.asarray(value)
+        scalar = _uniform_scalar(value)
+        if scalar is not None:
+            key = _array_uniform_key(value, scalar)
+        else:
+            if hasattr(value, "detach"):  # torch tensor
+                array = value.detach().cpu().contiguous().numpy()
+            else:  # numpy ndarray, list, or tuple
+                array = np.ascontiguousarray(np.asarray(value))
+            digest = hashlib.sha256(memoryview(array)).digest()
+            key = _array_content_key(value, digest)
 
-        if hasattr(value, "detach"):  # torch tensor
-            array = value.detach().cpu().contiguous().numpy()
-        else:  # numpy ndarray, list, or tuple
-            array = np.ascontiguousarray(np.asarray(value))
-        digest = hashlib.blake2b(array.tobytes(), digest_size=16).digest()
-
-        try:
-            ref = weakref.ref(
-                value, lambda _ref, _oid=oid: _ARRAY_DIGEST_CACHE.pop(_oid, None)
-            )
-        except TypeError:
-            ref = None  # e.g. list/tuple cannot be weak-referenced; skip memo
-        if ref is not None:
-            _ARRAY_DIGEST_CACHE[oid] = (ref, digest, token)
-        return _array_content_key(value, digest)
+        return key
 
     def _create_cache_key(self, wavelength: float | be.ndarray, **kwargs) -> tuple:
         """Creates a hashable cache key from wavelength and kwargs."""
         if be.is_array_like(wavelength):
             size = self._array_size(wavelength)
             if size is not None and size <= self._MAX_VALUE_KEY_ARRAY_SIZE:
-                wavelength_key = tuple(np.ravel(be.to_numpy(wavelength)))
+                wavelength_key = (
+                    "array-values",
+                    tuple(np.ravel(be.to_numpy(wavelength))),
+                    tuple(wavelength.shape),
+                    str(wavelength.dtype),
+                    str(getattr(wavelength, "device", None)),
+                )
             else:
                 wavelength_key = self._array_metadata_key(wavelength)
         else:
-            wavelength_key = wavelength
-        return (wavelength_key,) + tuple(sorted(kwargs.items()))
+            wavelength_key = (type(wavelength), wavelength)
+        return (wavelength_key, self._state_key(tuple(sorted(kwargs.items()))))
+
+    def _cache_state(self) -> tuple | None:
+        """Return a hashable optical-state token, or None to disable caching.
+
+        An immutable model can return an empty tuple. Mutable models must include
+        every parameter affecting n/k, and return None while parameters require
+        gradients. `_state_key` fingerprints ordinary numerical data safely,
+        including arrays mutated through aliases. Unknown custom state defaults
+        to uncached evaluation; subclasses need not opt in to remain usable.
+        Each concrete subclass must explicitly override this hook, including
+        subclasses of built-in materials that might add optical state.
+        """
+        return None
+
+    @classmethod
+    def _state_key(cls, value) -> tuple | None:
+        """Fingerprint numerical state; unsupported or trainable data disables reuse."""
+        if cls._requires_grad(value):
+            return None
+        if isinstance(value, (tuple, list)):
+            items = []
+            for item in value:
+                key = cls._state_key(item)
+                if key is None:
+                    return None
+                items.append(key)
+            return tuple(items)
+        if isinstance(value, (str, int, float, bool, type(None))):
+            return (type(value), value)
+        if isinstance(value, np.ndarray) or (
+            torch is not None and isinstance(value, torch.Tensor)
+        ):
+            if cls._array_size(value) <= cls._MAX_VALUE_KEY_ARRAY_SIZE:
+                # Small live parameter arrays need a snapshot, not a uniformity
+                # reduction or digest. Copy bytes so subsequent alias writes
+                # cannot alter the stored state token.
+                array = be.to_numpy(value)
+                return _array_content_key(value, array.tobytes())
+            return cls._array_metadata_key(value)
+        return None
+
+    @staticmethod
+    def _backend_context() -> tuple:
+        """Identify result type, precision, device and backend-created gradients."""
+        backend = be.get_backend()
+        device = be.get_device() if backend == "torch" else "cpu"
+        gradients = be.grad_mode.requires_grad if backend == "torch" else False
+        inference = torch.is_inference_mode_enabled() if backend == "torch" else False
+        return backend, be.get_precision(), device, gradients, inference
+
+    @staticmethod
+    def _as_backend_array(value, *, preserve_dtype: bool = False):
+        """Use live parameters in the active backend without replacing their storage.
+
+        Typed parameters can opt out of conversion to the backend's default
+        precision. Untyped values still use that default.
+        """
+        if be.get_backend() == "numpy" and hasattr(value, "detach"):
+            value = value.detach().cpu().numpy()
+        if preserve_dtype and hasattr(value, "dtype"):
+            return be.asarray(value, dtype=None)
+        return be.asarray(value)
 
     @staticmethod
     def _requires_grad(value) -> bool:
@@ -208,6 +301,69 @@ class BaseMaterial(ABC):
             return value.detach()
         return value
 
+    @staticmethod
+    def _is_uniform_key(cache_key: tuple) -> bool:
+        """True when the key's wavelength part marks a constant array."""
+        wavelength_key = cache_key[0]
+        return (
+            isinstance(wavelength_key, tuple)
+            and len(wavelength_key) > 0
+            and wavelength_key[0] == "array-uniform"
+        )
+
+    @staticmethod
+    def _uniform_representative(wavelength):
+        """A 1-element view of a constant wavelength array (same dtype/device)."""
+        if torch is not None and isinstance(wavelength, torch.Tensor):
+            return wavelength.reshape(-1)[:1]
+        return np.asarray(wavelength).reshape(-1)[:1]
+
+    @staticmethod
+    def _broadcast_like(value, wavelength):
+        """Expand a single-value result to the wavelength's shape as a view.
+
+        The expansion allocates no memory (stride-0 view), so a property
+        evaluated once per wavelength serves bundles of any size for free.
+        """
+        if torch is not None and isinstance(value, torch.Tensor):
+            return value.reshape(1).expand(tuple(np.shape(wavelength)))
+        return np.broadcast_to(np.asarray(value).reshape(1), np.shape(wavelength))
+
+    def _evaluate_property(self, property_name: str, wavelength, **kwargs):
+        """Evaluate n/k with one state-aware cache and fresh gradient graphs."""
+        calculate = getattr(self, f"_calculate_{property_name}")
+        if self._requires_grad(wavelength):
+            return self._compute_grad_aware(calculate, wavelength, **kwargs)
+        state = self._cache_state() if "_cache_state" in type(self).__dict__ else None
+        kwargs_state = self._state_key(tuple(sorted(kwargs.items())))
+        if state is None or kwargs_state is None:
+            self._n_cache.clear()
+            self._k_cache.clear()
+            self._cache_context = None
+            return self._compute_grad_aware(calculate, wavelength, **kwargs)
+
+        context = (self._backend_context(), state)
+        if context != self._cache_context:
+            self._n_cache.clear()
+            self._k_cache.clear()
+            self._cache_context = context
+
+        # Only non-trainable, tracked inputs reach cache lookup or reduction.
+        # Equal values do not imply equal derivatives for each query element.
+        cache = self._n_cache if property_name == "n" else self._k_cache
+        cache_key = self._create_cache_key(wavelength, **kwargs)
+        uniform = self._is_uniform_key(cache_key) and all(
+            value is None or np.isscalar(value) for value in kwargs.values()
+        )
+        if cache_key not in cache:
+            query = self._uniform_representative(wavelength) if uniform else wavelength
+            result = self._compute_grad_aware(calculate, query, **kwargs)
+            if self._requires_grad(result):
+                return self._broadcast_like(result, wavelength) if uniform else result
+            cache[cache_key] = self._detach_if_tensor(result)
+        result = cache[cache_key]
+        return self._broadcast_like(result, wavelength) if uniform else result
+
     def n(self, wavelength: float | be.ndarray, **kwargs) -> float | be.ndarray:
         """Calculates the refractive index at a given wavelength with caching.
 
@@ -219,23 +375,7 @@ class BaseMaterial(ABC):
         Returns:
             float | be.ndarray: The refractive index at the given wavelength(s).
         """
-        cache_key = self._create_cache_key(wavelength, **kwargs)
-
-        if cache_key in self._n_cache:
-            return self._n_cache[cache_key]
-
-        result = self._compute_grad_aware(self._calculate_n, wavelength, **kwargs)
-
-        # If the result requires grad, it is connected to an optimization
-        # variable (e.g. the index itself is being optimized).  In that case
-        # we must NOT cache — every forward pass needs a fresh graph.
-        if self._requires_grad(result):
-            return result
-
-        # Otherwise the value is a constant w.r.t. optimization variables.
-        # Detach before caching to avoid holding a stale computation graph.
-        self._n_cache[cache_key] = self._detach_if_tensor(result)
-        return self._n_cache[cache_key]
+        return self._evaluate_property("n", wavelength, **kwargs)
 
     def k(self, wavelength: float | be.ndarray, **kwargs) -> float | be.ndarray:
         """Calculates the extinction coefficient at a given wavelength with caching.
@@ -248,18 +388,7 @@ class BaseMaterial(ABC):
         Returns:
             float | be.ndarray: The extinction coefficient at the given wavelength(s).
         """
-        cache_key = self._create_cache_key(wavelength, **kwargs)
-
-        if cache_key in self._k_cache:
-            return self._k_cache[cache_key]
-
-        result = self._compute_grad_aware(self._calculate_k, wavelength, **kwargs)
-        # Same logic as n(): skip cache if result is differentiable.
-        if self._requires_grad(result):
-            return result
-
-        self._k_cache[cache_key] = self._detach_if_tensor(result)
-        return self._k_cache[cache_key]
+        return self._evaluate_property("k", wavelength, **kwargs)
 
     @abstractmethod
     def _calculate_n(
@@ -306,6 +435,21 @@ class BaseMaterial(ABC):
         nF = self.n(0.4861327)
         nC = self.n(0.6562725)
         return (nD - 1) / (nF - nC)
+
+    @property
+    def display_name(self) -> str:
+        """Human-readable identity; never a serialization or lookup key."""
+        return type(self).__name__
+
+    def spectral_range(self, property_name: str = "n") -> tuple[float, float] | None:
+        """Known validity limits in micrometers, or None if unspecified.
+
+        Consumers must supply a range when none is known. This information does
+        not change each material's evaluation or extrapolation policy.
+        """
+        if property_name not in {"n", "k"}:
+            raise ValueError("Material property must be 'n' or 'k'")
+        return None
 
     def to_dict(self):
         """Convert the material to a dictionary.

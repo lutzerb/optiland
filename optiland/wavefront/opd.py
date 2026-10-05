@@ -44,8 +44,11 @@ class OPD(Wavefront):
         field (tuple): The field at which to calculate the OPD.
         wavelength (str | float): The wavelength of the wavefront. Can be 'primary'
             or a float value.
-        num_rings (int, optional): The number of rings for ray tracing.
+        num_rays (int, optional): The sampling parameter that determines the number of
+            rays in the pupil. Its meaning depends on the value of `distribution`.
             Defaults to 15.
+        distribution (DistributionType, optional): The pupil sampling distribution.
+            Defaults to "hexapolar".
         strategy (str): The calculation strategy to use. Supported options are
             "chief_ray", "centroid", and "best_fit".
             Defaults to "chief_ray".
@@ -69,6 +72,14 @@ class OPD(Wavefront):
         view(projection='2d', num_points=256, figsize=(7, 5.5)): Visualizes
             the OPD wavefront.
         rms(): Calculates the root mean square (RMS) of the OPD wavefront.
+
+    Notes:
+        The interpretation of the `num_rays` argument depends on the value of
+        `distribution`. For example, if `distribution` is `hexapolar`, `num_rays`
+        specifies the number of rings, whereas when `distribution` is `uniform`, it
+        specifies the total number of rays per axis.
+
+        The `afocal` argument is forwarded to `Wavefront.__init__()` via `kwargs`.
 
     """
 
@@ -211,6 +222,9 @@ class OPD(Wavefront):
     def generate_opd_map(self, num_points: int = 256) -> OPDData:
         """Generates the OPD map data.
 
+        Interpolate retained OPD in waves. Positive intensity selects samples;
+        its magnitude does not scale the OPD values.
+
         Args:
             num_points (int, optional): The number of points for interpolation
                 along each axis of the grid. Defaults to 256.
@@ -226,12 +240,11 @@ class OPD(Wavefront):
         z = be.to_numpy(data.opd)
         intensity = be.to_numpy(data.intensity)
 
-        # Ignore zero intensity points
+        # Retain positive-intensity samples without scaling their OPD values.
         mask = intensity > 0
         x = x[mask]
         y = y[mask]
         z = z[mask]
-        intensity = intensity[mask]
 
         x_interp, y_interp = np.meshgrid(
             np.linspace(-1, 1, num_points),
@@ -239,7 +252,7 @@ class OPD(Wavefront):
         )
 
         points = np.column_stack((x.flatten(), y.flatten()))
-        values = z.flatten() * intensity.flatten()
+        values = z.flatten()
 
         z_interp = griddata(points, values, (x_interp, y_interp), method="cubic")
 

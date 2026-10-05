@@ -34,6 +34,7 @@ class ParaxialImageHeightField(BaseFieldDefinition):
             ValueError: If the field type is "object_height" for an object at
                 infinity.
         """
+        self._reject_folded_use(optic)
         y_img_target = optic.fields.max_field * Hy
         x_img_target = optic.fields.max_field * Hx
 
@@ -55,8 +56,10 @@ class ParaxialImageHeightField(BaseFieldDefinition):
             y0 = Py * EPD / 2 * vy + y
             z0 = be.full_like(Px, z)
         else:
-            y_obj = y_obj_unit * (y_img_target / y_img_unit)
-            x_obj = y_obj_unit * (x_img_target / y_img_unit)
+            # The two unit traces leave the stop with u=+1 in opposite directions,
+            # so the reverse ray's object point pairs with image height -y_img_unit.
+            y_obj = -y_obj_unit * (y_img_target / y_img_unit)
+            x_obj = -y_obj_unit * (x_img_target / y_img_unit)
             x_local = be.atleast_1d(be.array(x_obj))
             y_local = be.atleast_1d(be.array(y_obj))
             z_local = optic.object_surface.geometry.sag(x_local, y_local)
@@ -87,6 +90,7 @@ class ParaxialImageHeightField(BaseFieldDefinition):
                 position.
 
         """
+        self._reject_folded_use(optic)
         y_img_target = optic.fields.max_field * Hy
         y_img_unit, _ = self._trace_unit_chief_ray(optic, plane="image")
         y_obj_unit, u_obj_unit = self._trace_unit_chief_ray(optic, plane="object")
@@ -98,7 +102,7 @@ class ParaxialImageHeightField(BaseFieldDefinition):
             y0 = y1 + y
             z0 = be.ones_like(y1) * z
         else:
-            y_obj = y_obj_unit * (y_img_target / y_img_unit)
+            y_obj = -y_obj_unit * (y_img_target / y_img_unit)
             y = y_obj
             z = optic.object_surface.geometry.cs.z
             y0 = be.ones_like(y1) * y
@@ -161,4 +165,9 @@ class ParaxialImageHeightField(BaseFieldDefinition):
             y, u = optic.paraxial.trace_generic(
                 y=0, u=1, z=z_start, wavelength=wavelength, reverse=True, skip=skip
             )
-            return y[-1], u[-1]
+            y_obj, u_obj = y[-1], u[-1]
+            if not optic.object_surface.is_infinite:
+                # The reverse trace stops refracting at surface 1 -- the object
+                # surface only records it -- so carry the height back to the object.
+                y_obj = y_obj + (pos[1] - optic.object_surface.geometry.cs.z) * u_obj
+            return y_obj, u_obj
