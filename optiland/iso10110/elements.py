@@ -28,12 +28,17 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
+def _to_float(value) -> float:
+    """Convert a scalar or size-1 array (any backend) to a Python float."""
+    return float(np.asarray(be.to_numpy(be.array(value))).ravel()[0])
+
+
 def is_air(material) -> bool:
     """Return True if *material* is air or vacuum (n ≈ 1)."""
     if material is None:
         return True
     try:
-        n = float(np.asarray(be.to_numpy(be.array(material.n(0.5876)))))
+        n = _to_float(material.n(0.5876))
         return n < 1.01
     except Exception:
         return False
@@ -128,7 +133,7 @@ class LensElement:
                 return r
 
         if surf.semi_aperture is not None:
-            return float(abs(np.asarray(be.to_numpy(be.array(surf.semi_aperture)))))
+            return abs(_to_float(surf.semi_aperture))
         # Paraxial fallback
         from optiland.paraxial import Paraxial
 
@@ -145,24 +150,16 @@ class LensElement:
 
     def center_thickness(self, optic) -> float:
         """Total on-axis thickness of the element (front vertex to rear vertex)."""
-        z_front = float(
-            np.asarray(be.to_numpy(be.array(self.surfaces[0].geometry.cs.z)))
-        )
-        z_rear = float(
-            np.asarray(be.to_numpy(be.array(self.surfaces[-1].geometry.cs.z)))
-        )
+        z_front = _to_float(self.surfaces[0].geometry.cs.z)
+        z_rear = _to_float(self.surfaces[-1].geometry.cs.z)
         return abs(z_rear - z_front)
 
     def component_thicknesses(self, optic) -> list[float]:
         """Center thickness of each individual glass component."""
         thicknesses = []
         for i in range(len(self.surfaces) - 1):
-            z0 = float(
-                np.asarray(be.to_numpy(be.array(self.surfaces[i].geometry.cs.z)))
-            )
-            z1 = float(
-                np.asarray(be.to_numpy(be.array(self.surfaces[i + 1].geometry.cs.z)))
-            )
+            z0 = _to_float(self.surfaces[i].geometry.cs.z)
+            z1 = _to_float(self.surfaces[i + 1].geometry.cs.z)
             thicknesses.append(abs(z1 - z0))
         return thicknesses
 
@@ -171,7 +168,7 @@ class LensElement:
         result = []
         for surf in self.surfaces:
             try:
-                r = float(np.asarray(be.to_numpy(be.array(surf.geometry.radius))))
+                r = _to_float(surf.geometry.radius)
             except AttributeError:
                 r = float("inf")
             result.append(r)
